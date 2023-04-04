@@ -1,8 +1,8 @@
 use axum::{
     error_handling::HandleErrorLayer,
     http::StatusCode,
-    routing::{get, post},
-    BoxError, Extension, Json, Router, Server,
+    routing::post,
+    BoxError, Extension, Json, Router, Server, response::IntoResponse,
 };
 use clap::Parser;
 use notify::RecursiveMode;
@@ -21,9 +21,9 @@ use std::{
 };
 use tantivy::{
     collector::{Count, TopDocs},
-    query::{Query, QueryParser},
-    schema::{Schema, FAST, STORED, TEXT, FacetOptions, Facet},
-    Document, Index, IndexWriter, Result, Term,
+    query::{Query, QueryParser, RegexQuery},
+    schema::{Schema, STORED, FacetOptions, Facet, Field, TextFieldIndexing, IndexRecordOption, TextOptions},
+    Document, Index, IndexWriter, Result, Term, tokenizer::{TextAnalyzer, RemoveLongFilter, LowerCaser, WhitespaceTokenizer},
 };
 use tower::ServiceBuilder;
 
@@ -33,6 +33,8 @@ use futures::executor::block_on;
 struct SearchRequest {
     path: String,
     query: String,
+    regex: Option<bool>,
+    case_sensitive: Option<bool>,
 }
 
 #[derive(Serialize, Deserialize)]
@@ -50,6 +52,12 @@ struct Match {
     file_path: String,
     line_number: usize,
     line_content: String,
+}
+
+#[derive(Serialize, Deserialize)]
+struct SearchParseError {
+    recieved: String,
+    message: String,
 }
 
 #[derive(Parser, Clone)]
@@ -102,14 +110,16 @@ async fn main() -> Result<()> {
 
     println!("Mouting Schema...");
 
-    let schema = Arc::new(create_schema());
+    let tokenizer_name = "codeTokenizer";
+
+    let schema = Arc::new(create_schema(tokenizer_name));
 
     let index_path = match args.index_folder.clone() {
         Some(folder) => folder,
         None => index_dir.join("fileIndex")
     };
 
-    let first_index_exist = index_path.exists();
+    let first_index_exist = index_path.join("meta.json").exists();
 
     let index = match first_index_exist {
         true => Index::open_in_dir(index_path)?,
@@ -119,6 +129,9 @@ async fn main() -> Result<()> {
             Index::create_in_dir(index_path, schema.as_ref().clone())?
         }
     };
+
+    register_tokenizer(&index, tokenizer_name);
+
     let writer = index.writer(50_000_000)?;
     let writer = Arc::new(Mutex::new(writer));
 
@@ -146,7 +159,7 @@ async fn server_task(index: Index, schema: &Schema, writer: Arc<Mutex<IndexWrite
         .timeout(Duration::from_secs(90));
 
     let app = Router::new()
-        .route("/search", get(search_request))
+        .route("/search", post(search_request))
         .route("/index", post(index_request))
         .layer(middleware)
         .layer(Extension(start_args.clone()))
@@ -189,7 +202,7 @@ async fn watcher_task(
     println!("Starting Watcher...");
     let (tx, mut rx) = tokio::sync::mpsc::channel(100);
 
-    let mut debouncer = new_debouncer(Duration::from_secs(10), None, move |res| {
+    let mut debouncer = new_debouncer(Duration::from_secs(5), None, move |res| {
         block_on(async {
             tx.send(res).await.unwrap_or_default();
         })
@@ -226,37 +239,56 @@ fn process_index_event(
     let mut writer = writer.lock().unwrap();
     for event in events {
         let path = event.path;
-
-        println!("{}",  path.as_path().to_str().unwrap());
-
+        
         if path.is_file() {
             if let Some(ext) = path.extension() {
                 if ext == file_extension {
+                    delete_file_index(&schema, &mut writer, &path);
+
                     if path.exists() {
                         index_file_lines(&schema, &mut writer, &path);
-                    } else {
-                        delete_dir_files(&schema, &mut writer, &path);
                     }
                 }
             }
         } else if path.is_dir() {
             if !path.exists() {
-                delete_dir_files(&schema, &mut writer, &path);
+                delete_file_index(&schema, &mut writer, &path);
             }
         }
     }
     writer.commit().unwrap();
 }
 
-fn create_schema() -> Schema {
+fn create_schema(tokenizer_name: &str) -> Schema {
     let mut schema_builder = Schema::builder();
+
+    let text_field_indexing = TextFieldIndexing::default()
+    .set_tokenizer(tokenizer_name)
+    .set_index_option(IndexRecordOption::WithFreqsAndPositions);
+
+    let text_options = TextOptions::default()
+    .set_indexing_options(text_field_indexing)
+    .set_stored()
+    .set_fast();
+
     schema_builder.add_facet_field("file_path", FacetOptions::default().set_stored());
-    schema_builder.add_text_field("line_content", TEXT | FAST | STORED);
+    schema_builder.add_text_field("line_content", text_options);
     schema_builder.add_i64_field("line_number", STORED);
     schema_builder.build()
 }
 
-fn delete_dir_files(schema: &Schema, writer: &mut IndexWriter, path: &Path) {
+fn register_tokenizer(index: &Index, tokenizer_name: &str) {
+
+    let custom_en_tokenizer = TextAnalyzer::from(WhitespaceTokenizer)
+    .filter(LowerCaser)
+    .filter(RemoveLongFilter::limit(40));
+
+    index
+    .tokenizers()
+    .register(tokenizer_name, custom_en_tokenizer);
+}
+
+fn delete_file_index(schema: &Schema, writer: &mut IndexWriter, path: &Path) {
     let facet_path = file_path_to_facet_path(&path);
     let facet = Facet::from_path(facet_path);
     let file_path_schema = schema.get_field("file_path").unwrap();
@@ -307,7 +339,7 @@ async fn index_request(
         None => Path::new("."),
     };
 
-    let dir_map = build_dir_map(index_dir, &startup_args.file_extension).await;
+    let dir_map = build_dir_map(index_dir, &startup_args.file_extension);
 
     dir_map.par_iter().for_each(|file| {
         let writer = Arc::clone(&writer);
@@ -321,7 +353,7 @@ async fn index_request(
 
 async fn index_full_dir(index_dir: &Path, file_extension: &str, writer: Arc<Mutex<IndexWriter>>, schema: Arc<Schema>) -> Result<()>{
     println!("Indexing Files...");
-    let dir_map = build_dir_map(index_dir, file_extension).await;
+    let dir_map = build_dir_map(index_dir, file_extension);
 
     writer.lock().unwrap().delete_all_documents().unwrap();
 
@@ -340,14 +372,23 @@ async fn search_request(
     index: Extension<Index>,
     schema: Extension<Schema>,
     Json(request): Json<SearchRequest>,
-) -> Json<SearchResult> {
+) -> impl IntoResponse {
     let reader = index.reader().unwrap();
     let searcher = reader.searcher();
 
-    let query_parser =
-        QueryParser::for_index(&index, vec![schema.get_field("line_content").unwrap()]);
+    let file_path_schema = schema.get_field("file_path").unwrap();
+    let line_number_schema = schema.get_field("line_number").unwrap();
+    let line_content_schema = schema.get_field("line_content").unwrap();
 
-    let query = build_query(query_parser, &request);
+    let query = match build_query(&index, &request, &line_content_schema) {
+        Ok(query) => query,
+        Err(e) => {
+            return (StatusCode::BAD_REQUEST, Json(SearchParseError{
+                recieved: request.query,
+                message: e.to_string()
+            })).into_response();
+        }
+    };
 
     let doc_quantity = searcher.search(&query, &Count).unwrap();
 
@@ -357,10 +398,6 @@ async fn search_request(
         .search(&query, &TopDocs::with_limit(max_limit))
         .unwrap();
     let mut results: Vec<Match> = Vec::with_capacity(max_limit);
-
-    let file_path_schema = schema.get_field("file_path").unwrap();
-    let line_number_schema = schema.get_field("line_number").unwrap();
-    let line_content_schema = schema.get_field("line_content").unwrap();
 
     for (_score, doc_address) in top_docs {
         let retrieved_doc = searcher.doc(doc_address).unwrap();
@@ -389,45 +426,68 @@ async fn search_request(
         };
         results.push(result);
     }
-
-    Json(SearchResult {
+    (StatusCode::OK, Json(SearchResult {
         quantity: doc_quantity,
         matches: results,
-    })
+    })).into_response()
 }
 
-fn build_query(query_parser: QueryParser, request: &SearchRequest) -> Box<dyn Query> {
-    let mut query = scape_query(&request.query);
+fn build_query(index: &Index, request: &SearchRequest, line_content_schema: &Field) -> Result<Box<dyn Query>> {
+    println!("Building Query... ");
+    let regex = match &request.regex {
+        Some(val) => val,
+        None => &false,
+    };
 
-    query = format!("'{}'", query);
+    let case_sensitive = match &request.case_sensitive {
+        Some(val) => val,
+        None => &false,
+    };
 
-    query_parser.parse_query(query.as_str()).unwrap()
+    if *regex {
+        let mut query = String::from(&request.query);
+
+        if !*case_sensitive {
+            query = format!("(i+){}", query);
+        }
+
+        Ok(Box::new(RegexQuery::from_pattern(&query, *line_content_schema)?))
+    } else {
+        let mut query_parser = QueryParser::for_index(&index, vec!(*line_content_schema));
+        query_parser.set_conjunction_by_default();
+
+        let query = scape_query(&request.query);
+        
+        Ok(query_parser.parse_query(query.as_str())?)
+    }
 }
 
-pub const SPECIAL_CHARS_NO_SPACE: &[char] = &[
-    '+', '^', '`', ':', '{', '}', '"', '[', ']', '(', ')', '~', '!', '\\', '*',
+pub const SPECIAL_CHARS_SCAPE: &[char] = &[
+    '\\', '+', '^', '`', ':', '{', '}', '"', '[', ']', '~', '!', '*', '\"', '(', ')'
 ];
 
 //Until tantivy doesnt get a latient verison
 fn scape_query(query: &String) -> String {
     let mut scrubbed_query = query.to_string();
 
-    for c in SPECIAL_CHARS_NO_SPACE.iter() {
+    for c in SPECIAL_CHARS_SCAPE.iter() {
         scrubbed_query = scrubbed_query.replace(*c, &format!("\\{}", c));
     }
 
     scrubbed_query = scrubbed_query.replace("/", "//");
 
-    let quote_count = scrubbed_query.chars().filter(|&c| c == '\"').count();
+    let quote_count = scrubbed_query.chars().filter(|&c| c == '\'').count();
 
     if quote_count % 2 == 1 {
-        scrubbed_query = scrubbed_query.replace("\"", "\\\"");
+        scrubbed_query = scrubbed_query.replace("\'", "\\\'");
     }
+
+    scrubbed_query = format!("\"{}\"", scrubbed_query);
 
     scrubbed_query
 }
 
-async fn build_dir_map(index_dir: &Path, extension: &str) -> Vec<PathBuf> {
+fn build_dir_map(index_dir: &Path, extension: &str) -> Vec<PathBuf> {
     let dir: Vec<String> = SearchBuilder::default()
         .location(index_dir)
         .ext(extension)
