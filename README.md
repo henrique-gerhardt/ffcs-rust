@@ -10,11 +10,17 @@ Basic usage:
 ```
 Options:
 -p, --port <PORT>                  Port where to start the Service [default: 4000]
+  
 -e, --file_extension <EXTENSION>   Extension os the files to be search (can be ommited in case of all file extensions)
+  
 -f, --root_path <PATH>             Root indexed folder [default: .]  
+  
 -i, --index_folder <PATH_INDEX>    Root path where the indexes will be stored [default: ./fileIndex]
+  
 -r, --reload_index...              Force re-index of rootpath
+  
 -h, --help                         Print help
+  
 -V, --version                      Print version
 
   
