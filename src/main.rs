@@ -20,10 +20,10 @@ use std::{
     time::Duration,
 };
 use tantivy::{
-    collector::{Count, TopDocs},
+    collector::{Count, TopDocs, Collector},
     query::{Query, QueryParser, RegexQuery},
-    schema::{Schema, STORED, FacetOptions, Facet, Field, TextFieldIndexing, IndexRecordOption, TextOptions},
-    Document, Index, IndexWriter, Result, Term, tokenizer::{TextAnalyzer, RemoveLongFilter, LowerCaser, WhitespaceTokenizer},
+    schema::{Schema, STORED, FacetOptions, Facet, Field, FAST, TEXT},
+    Document, Index, IndexWriter, Result, Term, SegmentReader, DocId, Score, DocAddress,
 };
 use tower::ServiceBuilder;
 
@@ -52,6 +52,7 @@ struct Match {
     file_path: String,
     line_number: usize,
     line_content: String,
+    score: f32,
 }
 
 #[derive(Serialize, Deserialize)]
@@ -110,9 +111,7 @@ async fn main() -> Result<()> {
 
     println!("Mouting Schema...");
 
-    let tokenizer_name = "codeTokenizer";
-
-    let schema = Arc::new(create_schema(tokenizer_name));
+    let schema = Arc::new(create_schema());
 
     let index_path = match args.index_folder.clone() {
         Some(folder) => folder,
@@ -129,8 +128,6 @@ async fn main() -> Result<()> {
             Index::create_in_dir(index_path, schema.as_ref().clone())?
         }
     };
-
-    register_tokenizer(&index, tokenizer_name);
 
     let writer = index.writer(50_000_000)?;
     let writer = Arc::new(Mutex::new(writer));
@@ -259,34 +256,17 @@ fn process_index_event(
     writer.commit().unwrap();
 }
 
-fn create_schema(tokenizer_name: &str) -> Schema {
+fn create_schema() -> Schema {
     let mut schema_builder = Schema::builder();
 
-    let text_field_indexing = TextFieldIndexing::default()
-    .set_tokenizer(tokenizer_name)
-    .set_index_option(IndexRecordOption::WithFreqsAndPositions);
-
-    let text_options = TextOptions::default()
-    .set_indexing_options(text_field_indexing)
-    .set_stored()
-    .set_fast();
-
     schema_builder.add_facet_field("file_path", FacetOptions::default().set_stored());
-    schema_builder.add_text_field("line_content", text_options);
+    schema_builder.add_text_field("line_index", TEXT);
+    schema_builder.add_bytes_field("line_scorer",  FAST);
+    schema_builder.add_text_field("line_content", STORED);
     schema_builder.add_i64_field("line_number", STORED);
     schema_builder.build()
 }
 
-fn register_tokenizer(index: &Index, tokenizer_name: &str) {
-
-    let custom_en_tokenizer = TextAnalyzer::from(WhitespaceTokenizer)
-    .filter(LowerCaser)
-    .filter(RemoveLongFilter::limit(40));
-
-    index
-    .tokenizers()
-    .register(tokenizer_name, custom_en_tokenizer);
-}
 
 fn delete_file_index(schema: &Schema, writer: &mut IndexWriter, path: &Path) {
     let facet_path = file_path_to_facet_path(&path);
@@ -301,7 +281,11 @@ fn index_file_lines(schema: &Schema, writer: &mut IndexWriter, path: &PathBuf) {
     let reader = BufReader::new(file);
 
     let file_path_schema = schema.get_field("file_path").unwrap();
+
+    let line_index_schema = schema.get_field("line_index").unwrap();
+    let line_scorer_schema = schema.get_field("line_scorer").unwrap();
     let line_content_schema = schema.get_field("line_content").unwrap();
+    
     let line_number_schema = schema.get_field("line_number").unwrap();
 
     let facet_path = file_path_to_facet_path(&path);
@@ -313,8 +297,10 @@ fn index_file_lines(schema: &Schema, writer: &mut IndexWriter, path: &PathBuf) {
         let line = line.split_whitespace().collect::<Vec<&str>>().join(" ");
 
         doc.add_facet(file_path_schema, Facet::from_path(&facet_path));
+        doc.add_text(line_index_schema, &line);
         doc.add_text(line_content_schema, &line);
         doc.add_i64(line_number_schema, line_number as i64);
+        doc.add_bytes(line_scorer_schema, to_ascii_string(&line).as_bytes());
         writer.add_document(doc).unwrap();
     }
 }
@@ -379,8 +365,10 @@ async fn search_request(
     let file_path_schema = schema.get_field("file_path").unwrap();
     let line_number_schema = schema.get_field("line_number").unwrap();
     let line_content_schema = schema.get_field("line_content").unwrap();
+    let line_index_schema = schema.get_field("line_index").unwrap();
+    let line_scorer_schema = schema.get_field("line_scorer").unwrap();
 
-    let query = match build_query(&index, &request, &line_content_schema) {
+    let query = match build_query(&index, &request, &line_index_schema) {
         Ok(query) => query,
         Err(e) => {
             return (StatusCode::BAD_REQUEST, Json(SearchParseError{
@@ -392,14 +380,17 @@ async fn search_request(
 
     let doc_quantity = searcher.search(&query, &Count).unwrap();
 
+
     let max_limit = 1000;
 
-    let top_docs = searcher
-        .search(&query, &TopDocs::with_limit(max_limit))
-        .unwrap();
+    let top_docs = get_scoring_method(request, max_limit, line_scorer_schema);
+
+    let search_result = searcher
+        .search(&query, &top_docs).unwrap();
+
     let mut results: Vec<Match> = Vec::with_capacity(max_limit);
 
-    for (_score, doc_address) in top_docs {
+    for (score, doc_address) in search_result {
         let retrieved_doc = searcher.doc(doc_address).unwrap();
 
         let file_path: String = retrieved_doc
@@ -423,6 +414,7 @@ async fn search_request(
             file_path,
             line_number,
             line_content,
+            score,
         };
         results.push(result);
     }
@@ -432,8 +424,33 @@ async fn search_request(
     })).into_response()
 }
 
-fn build_query(index: &Index, request: &SearchRequest, line_content_schema: &Field) -> Result<Box<dyn Query>> {
-    println!("Building Query... ");
+
+//This function increase the score of the document if the query is a substring of the line
+fn get_scoring_method(request: SearchRequest, max_limit: usize, line_scorer_schema: Field) -> impl Collector<Fruit = Vec<(f32, DocAddress)>> {
+    let search_query: String = to_ascii_string(&request.query);
+
+    let top_docs = TopDocs::with_limit(max_limit)
+    .tweak_score(move |segment_reader: &SegmentReader| {
+        let string_bytes = segment_reader.fast_fields().bytes(line_scorer_schema).unwrap();
+
+        let substring_bytes = search_query.as_bytes().to_owned();
+
+        let bytes_length = substring_bytes.len();
+
+        move |doc: DocId, original_score: Score| {
+            (string_bytes.get_bytes(doc)
+                .windows(bytes_length)
+                .any(|window| window == substring_bytes) as u32 * 10) as Score + original_score
+        }
+    });
+    top_docs
+}
+
+fn to_ascii_string(value: &str) -> String {
+    value.chars().filter(|c| c.is_ascii()).collect::<String>()
+}
+
+fn build_query(index: &Index, request: &SearchRequest, index_schema: &Field) -> Result<Box<dyn Query>> {
     let regex = match &request.regex {
         Some(val) => val,
         None => &false,
@@ -451,9 +468,9 @@ fn build_query(index: &Index, request: &SearchRequest, line_content_schema: &Fie
             query = format!("(i+){}", query);
         }
 
-        Ok(Box::new(RegexQuery::from_pattern(&query, *line_content_schema)?))
+        Ok(Box::new(RegexQuery::from_pattern(&query, *index_schema)?))
     } else {
-        let mut query_parser = QueryParser::for_index(&index, vec!(*line_content_schema));
+        let mut query_parser = QueryParser::for_index(&index, vec!(*index_schema));
         query_parser.set_conjunction_by_default();
 
         let query = scape_query(&request.query);
@@ -482,7 +499,7 @@ fn scape_query(query: &String) -> String {
         scrubbed_query = scrubbed_query.replace("\'", "\\\'");
     }
 
-    scrubbed_query = format!("\"{}\"", scrubbed_query);
+    scrubbed_query = format!("\"{}\"", scrubbed_query.to_lowercase());
 
     scrubbed_query
 }
